@@ -1,45 +1,156 @@
-from flask import Flask, request, jsonify
-import base64
 import json
-import sys
+from flask import Flask, request, jsonify
+import requests
+import base64
+
+PROMETHEUS_URL = "http://support-prometheus-server.monitoring.svc.cluster.local:9090"
+
 
 app = Flask(__name__)
 
+def query_prometheus(query):
+    response = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query})
+    result = response.json()
+    if result["status"] == "success" and result["data"]["result"]:
+        return float(result["data"]["result"][0]["value"][1])
+    return None
+
+# Convert CPU values
+def parse_cpu(cpu_str):
+    return int(cpu_str.replace("m", "")) if "m" in cpu_str else int(float(cpu_str) * 1000)
+
+# Convert memory values
+def parse_memory(mem_str):
+    if mem_str.endswith("Mi"):
+        return int(mem_str.replace("Mi", ""))
+    elif mem_str.endswith("Gi"):
+        return int(float(mem_str.replace("Gi", "")) * 1024)
+    return 0
+
 @app.route('/mutate', methods=['POST'])
 def mutate():
-    try:
-        req = request.get_json(force=True)
-        print("Incoming request JSON:", json.dumps(req), file=sys.stderr)
-    except Exception as e:
-        print("Failed to parse request:", str(e), file=sys.stderr)
-        return "Bad request", 400
-    uid = req['request']['uid']
+    """
+    Processes of mutating the CPU and memory requests. 
+    1. The single user container in a pod is identified by filtering the image ending with 'user-image'.
+    2. The app querys the Prometheus API for max(95 percentile usage for all the pods in the same namespace).
+    3. The app sets the recommended CPU and memory requests to max(95 percentile). 
+    """
 
-    patch = [
-        {
-            "op": "add",
-            "path": "/spec/containers/0/resources",
-            "value": {
-                "requests": {"cpu": "500m", "memory": "512Mi"},
-                "limits": {"cpu": "1", "memory": "1Gi"}
+    admission_review = request.get_json(force=True)
+    request_obj = admission_review["request"]
+    uid = request_obj['uid']
+    pod = request_obj["object"]
+    namespace = pod["metadata"]["namespace"]
+    pod_name = pod["metadata"]["name"]
+    containers = pod["spec"].get("containers", [])
+
+    # Find the container that ends with 'user-image'
+    result = next(
+        ((i, c) for i, c in enumerate(containers) if c.get("image", "").endswith("user-image")),
+        (None, None)
+    )
+    target_index, target_container = result
+
+    recommended_cpu_millicores = 0
+    recommended_mem_mebibytes = 0
+
+    if target_container:
+        name = target_container.get("name")
+        image = target_container.get("image", "")
+        resources = target_container.get("resources", {})
+        requests = resources.get("requests", {})
+        limits = resources.get("limits", {})
+
+        cpu_request_str = requests.get("cpu", "100m") # default 0.1 core if not set
+        mem_request_str = requests.get("memory", "256Mi") # default 256 Mi if not set
+        cpu_limit_str = limits.get("cpu", "1000m")  # default 1 core if not set
+        mem_limit_str = limits.get("memory", "4Gi")  # default 4Gi if not set
+
+        cpu_request = parse_cpu(cpu_request_str)
+        cpu_limit = parse_cpu(cpu_limit_str)
+        mem_request = parse_memory(mem_request_str)
+        mem_limit = parse_memory(mem_limit_str)
+
+        print(
+            f"Pod: {pod_name}, Container: {name}, Image: {image}, "
+            f"CPU Request: {cpu_request}m, Memory Request: {mem_request}Mi, "
+            f"CPU Limit: {cpu_limit}m, Memory Limit: {mem_limit}Mi"
+        )
+
+        # Prometheus queries
+        # 95th percentile CPU usage over a 1h window
+        cpu_query_95 = f'''
+            max(quantile_over_time(0.95, rate(container_cpu_usage_seconds_total{{namespace="{namespace}", container!="", container!="mongo", container!="postgres", pod=~"jupyter-.*", cloud_google_com_gke_nodepool=~"user-.*"}}[5m])[1h:]))
+        '''
+        # 95th percentile memory usage over a 1h window
+        mem_query_95 = f'''
+            max(quantile_over_time(0.95, container_memory_usage_bytes{{namespace="{namespace}", container!="", container!="mongo", container!="postgres", pod=~"jupyter-.*", cloud_google_com_gke_nodepool=~"user-.*"}}[1h:]))
+        '''
+        try:
+            cpu_95_percentile = query_prometheus(cpu_query_95)
+            mem_95_percentile = query_prometheus(mem_query_95)
+        except:
+            print(f"Prometheus query failed in the namespace {namespace}. ")
+            cpu_95_percentile = None
+            mem_95_percentile = None
+
+        # Convert to Kubernetes expected units
+        if cpu_95_percentile is not None:
+            # CPU request can not exceed the CPU limit
+            recommended_cpu_millicores = min(int(cpu_95_percentile * 1000), cpu_limit) 
+        else:
+            # If no prometheus data is found, the CPU request is not modified.
+            recommended_cpu_millicores = cpu_request
+
+        if mem_95_percentile is not None:
+            # Memory request can not exceed the memory limit. 
+            recommended_mem_mebibytes = min(int(mem_95_percentile / 1024 / 1024), mem_limit)
+        else:
+            # If no prometheus data is found, the memory request is not modified. 
+            recommended_mem_mebibytes = mem_request
+        
+        print(f"Recommended CPU Request: {recommended_cpu_millicores}m")
+        print(f"Recommended Memory Request: {recommended_mem_mebibytes}Mi")
+    else:
+        print(f"Pod: {pod_name}, No container found with image ending in 'user-image'")
+
+
+    if target_index is not None:
+        patch = [
+            {
+                "op": "add",
+                "path": f"/spec/containers/{target_index}/resources/requests",
+                "value": {
+                    "cpu": f"{recommended_cpu_millicores}m",
+                    "memory": f"{recommended_mem_mebibytes}Mi"
+                }
+            }
+        ]
+
+        admission_response = {
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "response": {
+                "uid": uid,
+                "allowed": True,
+                "patchType": "JSONPatch",
+                "patch": base64.b64encode(json.dumps(patch).encode()).decode()
             }
         }
-    ]
-
-    admission_response = {
-        "apiVersion": "admission.k8s.io/v1",
-        "kind": "AdmissionReview",
-        "response": {
-            "uid": uid,
-            "allowed": True,
-            "patchType": "JSONPatch",
-            "patch": base64.b64encode(json.dumps(patch).encode()).decode()
+    else:
+        admission_response = {
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "response": {
+                "uid": uid,
+                "allowed": True
+            }
         }
-    }
 
     return jsonify(admission_response)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=443, ssl_context=('/certs/tls.crt', '/certs/tls.key'))
+
 
 
