@@ -112,26 +112,30 @@ def mutate():
 
         # Convert to Kubernetes expected units
         if cpu_95_percentile is not None:
-            # CPU request can not exceed the CPU limit
             prometheus_cpu = int(cpu_95_percentile * 1000)
             app.logger.info(f"Prometheus 95 percentile CPU is {prometheus_cpu} m.")
             if cpu_limit != 0:
+                # CPU request can not exceed the CPU limit
                 recommended_cpu_millicores = min(prometheus_cpu, cpu_limit) 
             else:
                 recommended_cpu_millicores = prometheus_cpu
+            # allocate at least the CPU request value 
+            recommended_cpu_millicores = max(recommended_cpu_millicores, cpu_request)
         else:
             # If no prometheus data is found, the CPU request is not modified.
             app.logger.info("No Prometheus data is available for modifiying CPU requests. The CPU request will remain unchanged. ")
             recommended_cpu_millicores = cpu_request
 
         if mem_95_percentile is not None:
-            # Memory request can not exceed the memory limit. 
             prometheus_mem = int(mem_95_percentile / 1024 / 1024)
             app.logger.info(f"Prometheus 95 percentile memory is {prometheus_mem} Mi.")
             if mem_limit != 0:
+                # Memory request can not exceed the memory limit. 
                 recommended_mem_mebibytes = min(prometheus_mem, mem_limit)
             else:
                 recommended_mem_mebibytes = prometheus_mem
+            # allocate at least the memory request value
+            recommended_mem_mebibytes = max(recommended_mem_mebibytes, mem_request)
         else:
             # If no prometheus data is found, the memory request is not modified. 
             app.logger.info("No Prometheus data is available for modifiying memory requests. The memory request will remain unchanged. ")
